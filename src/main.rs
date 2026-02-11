@@ -9,17 +9,20 @@ use embassy_net::{IpAddress, Ipv4Address, Stack, StackResources, dns};
 use embassy_stm32::SharedData;
 use embassy_stm32::eth::{Ethernet, GenericPhy, PacketQueue, Sma};
 use embassy_stm32::flash::{BANK1_REGION, Flash, WRITE_SIZE};
+use embassy_stm32::gpio::{AnyPin, Level, Output, Speed};
 use embassy_stm32::peripherals::{ETH, ETH_SMA, RNG};
 use embassy_stm32::rng::Rng;
-use embassy_stm32::{Config, bind_interrupts, eth, flash, peripherals, rng};
+use embassy_stm32::{Config, Peri, bind_interrupts, eth, flash, peripherals, rng};
 use embassy_time::Timer;
 
 // MQTT support
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
-use rust_mqtt::client::{Client, options::ConnectOptions};
+use rust_mqtt::client::{
+    Client, event::Event, options::ConnectOptions, options::PublicationOptions,
+};
 use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
-use rust_mqtt::types::MqttString;
+use rust_mqtt::types::{MqttString, TopicName};
 
 // TLS support
 use embedded_tls::{
@@ -87,6 +90,9 @@ async fn main(spawner: Spawner) {
     }
     let p = embassy_stm32::init_primary(config, &SHARED_DATA);
     info!("Clock and peripherals ready!");
+
+    // Start blinky as proof that we aren't significantly stalling at any point
+    unwrap!(spawner.spawn(blinky(p.PB0.into(), 200)));
 
     // --- BEGIN READING CREDENTIALS ---
     let mut f = Flash::new(p.FLASH, Irqs);
@@ -181,14 +187,70 @@ async fn main(spawner: Spawner) {
             Err(()) => continue,
         };
 
+        // Ping the broker once
+        match mqtt_client.ping().await {
+            Ok(()) => {
+                info!("MQTT ping to {} successful!", server_name);
+                loop {
+                    match mqtt_client.poll().await {
+                        Ok(Event::Pingresp) => {
+                            info!("Ping response received");
+                            break;
+                        }
+                        Ok(e) => info!("Received event {:?}", e),
+                        Err(e) => {
+                            error!("Failed to poll: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("MQTT ping to {} failed, error: {:?}", server_name, e);
+                continue;
+            }
+        }
+
         loop {
-            //let r = tls.write_all(&[0]).await;
-            match mqtt_client.ping().await {
-                Ok(()) => {
-                    info!("MQTT ping to {} successful!", server_name);
+            let tn: Bytes = b"test/topic".as_slice().into();
+            let tn: MqttString = MqttString::new(tn).unwrap();
+            let tn: TopicName = unsafe { TopicName::new_unchecked(tn) };
+            let pub_opts = PublicationOptions {
+                topic: tn,
+                qos: rust_mqtt::types::QoS::AtLeastOnce,
+                retain: false,
+            };
+            match mqtt_client
+                .publish(&pub_opts, b"Hello world!".as_slice().into())
+                .await
+            {
+                Ok(_) => {
+                    let mut success: bool = true;
+                    info!("MQTT publish to {} successful!", server_name);
+                    loop {
+                        match mqtt_client.poll().await {
+                            Ok(Event::PublishAcknowledged(_)) => {
+                                info!("Publish acknowledged");
+                                break;
+                            }
+                            Ok(Event::PublishComplete(_)) => {
+                                info!("Publish complete");
+                                break;
+                            }
+                            Ok(e) => info!("Received event {:?}", e),
+                            Err(e) => {
+                                error!("Failed to poll: {:?}", e);
+                                success = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !success {
+                        break;
+                    }
                 }
                 Err(e) => {
-                    info!("MQTT ping to {} failed, error: {:?}", server_name, e);
+                    error!("MQTT publish to {} failed, error: {:?}", server_name, e);
                     break;
                 }
             }
@@ -201,6 +263,18 @@ async fn main(spawner: Spawner) {
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, EthernetDevice>) -> ! {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn blinky(led: Peri<'static, AnyPin>, period: u64) -> ! {
+    let mut led = Output::new(led, Level::Low, Speed::Low);
+    loop {
+        led.set_high();
+        Timer::after_millis(period / 2).await;
+
+        led.set_low();
+        Timer::after_millis(period / 2).await;
+    }
 }
 
 async fn connect_mqtt_client<'a>(
