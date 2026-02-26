@@ -38,8 +38,8 @@ fn proto_generate() {
         .add_protoc_arg("-Iproto");
     generator
         .compile_protos(
-            &["storage.proto"],
-            std::env::var("OUT_DIR").unwrap() + "/storage-proto.rs",
+            &["storage.proto", "measure.proto"],
+            std::env::var("OUT_DIR").unwrap() + "/aiqc-proto.rs",
         )
         .unwrap();
     println!("cargo:rerun-if-changed=proto");

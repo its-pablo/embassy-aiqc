@@ -42,7 +42,7 @@ use micropb::{MessageDecode, PbDecoder};
 mod proto {
     #![allow(clippy::all)]
     #![allow(nonstandard_style, unused, irrefutable_let_patterns)]
-    include!(concat!(env!("OUT_DIR"), "/storage-proto.rs"));
+    include!(concat!(env!("OUT_DIR"), "/aiqc-proto.rs"));
 }
 
 use proto::storage_::{Credentials, Credentials_::Broker};
@@ -221,7 +221,12 @@ async fn main(spawner: Spawner) {
                 retain: false,
             };
             match mqtt_client
-                .publish(&pub_opts, b"Hello world!".as_slice().into())
+                .publish(
+                    &pub_opts,
+                    b"{\"message\": \"Hello from STM32 NUCLEO-H755ZI-Q!\"}"
+                        .as_slice()
+                        .into(),
+                )
                 .await
             {
                 Ok(_) => {
