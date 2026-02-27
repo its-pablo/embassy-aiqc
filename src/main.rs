@@ -2,9 +2,11 @@
 #![no_main]
 
 use core::mem::MaybeUninit;
+use core::net::SocketAddr;
 
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
+use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpAddress, Ipv4Address, Stack, StackResources, dns};
 use embassy_stm32::SharedData;
 use embassy_stm32::eth::{Ethernet, GenericPhy, PacketQueue, Sma};
@@ -12,6 +14,7 @@ use embassy_stm32::flash::{BANK1_REGION, Flash, WRITE_SIZE};
 use embassy_stm32::gpio::{AnyPin, Level, Output, Speed};
 use embassy_stm32::peripherals::{ETH, ETH_SMA, RNG};
 use embassy_stm32::rng::Rng;
+use embassy_stm32::rtc::{Rtc, RtcConfig, RtcTimeProvider};
 use embassy_stm32::{Config, Peri, bind_interrupts, eth, flash, peripherals, rng};
 use embassy_time::Timer;
 
@@ -28,6 +31,11 @@ use rust_mqtt::types::{MqttString, TopicName};
 use embedded_tls::{
     Aes128GcmSha256, Certificate::X509, TlsConfig, TlsConnection, TlsContext, UnsecureProvider,
 };
+
+// NTP and time support
+use chrono::{DateTime, Duration, NaiveDateTime};
+use sntpc::{NtpContext, NtpTimestampGenerator, fraction_to_nanoseconds, get_time};
+use sntpc_net_embassy::UdpSocketWrapper;
 
 // Supplemental crates for network stack
 use static_cell::StaticCell;
@@ -63,6 +71,28 @@ bind_interrupts!(struct Irqs {
 });
 
 const CREDENTIALS_OFFSET: u32 = BANK1_REGION.size / 2;
+const NTP_SERVER: &str = "pool.ntp.org";
+
+#[derive(Copy, Clone)]
+struct TimestampGenerator<'a> {
+    duration: Duration,
+    time_provider: &'a RtcTimeProvider,
+}
+
+impl NtpTimestampGenerator for TimestampGenerator<'_> {
+    fn init(&mut self) {
+        let now: NaiveDateTime = self.time_provider.now().unwrap().into();
+        self.duration = now.signed_duration_since(DateTime::UNIX_EPOCH.naive_utc());
+    }
+
+    fn timestamp_sec(&self) -> u64 {
+        self.duration.num_seconds() as u64
+    }
+
+    fn timestamp_subsec_micros(&self) -> u32 {
+        self.duration.subsec_micros() as u32
+    }
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -100,6 +130,19 @@ async fn main(spawner: Spawner) {
     unwrap!(read_credentials(&mut f, &mut credentials));
     info!("Credentials read successfully!");
     // --- END READING CREDENTIALS ---
+
+    // Set up RTC for time keeping
+    let (mut rtc, time_provider) = Rtc::new(p.RTC, RtcConfig::default());
+    let rtc_time = time_provider.now().unwrap();
+    info!(
+        "Current time from RTC at boot: {}-{}-{} {}:{}:{}",
+        rtc_time.year(),
+        rtc_time.month(),
+        rtc_time.day(),
+        rtc_time.hour(),
+        rtc_time.minute(),
+        rtc_time.second()
+    );
 
     // --- BEGIN NETWORK STACK SETUP ---
     // RNG peripheral needed for network stack
@@ -145,6 +188,74 @@ async fn main(spawner: Spawner) {
 
     // --- BEGIN MQTT CLIENT ---
     loop {
+        // Buffers for TCP and UDP sockets
+        let mut rx_buffer = [0; 4096];
+        let mut tx_buffer = [0; 4096];
+
+        // Get NTP time and set RTC
+        {
+            // Get NTP endpoint information
+            let ntp_port = 123;
+            let ntp_addr: Ipv4Address =
+                match stack.dns_query(NTP_SERVER, dns::DnsQueryType::A).await {
+                    Ok(addrs) => match addrs[0] {
+                        IpAddress::Ipv4(addr) => addr,
+                    },
+                    Err(e) => {
+                        error!("DNS query failed for {}: {:?}", NTP_SERVER, e);
+                        continue;
+                    }
+                };
+
+            let mut rx_meta = [PacketMetadata::EMPTY; 16];
+            let mut tx_meta = [PacketMetadata::EMPTY; 16];
+            let mut udp_socket = UdpSocket::new(
+                stack,
+                &mut rx_meta,
+                &mut rx_buffer,
+                &mut tx_meta,
+                &mut tx_buffer,
+            );
+            udp_socket.bind(123).unwrap();
+            let udp_socket = UdpSocketWrapper::new(udp_socket);
+            let ts_gen = TimestampGenerator {
+                duration: Duration::zero(),
+                time_provider: &time_provider,
+            };
+            let ntp_context = NtpContext::new(ts_gen);
+            let ntp_result = get_time(
+                SocketAddr::from((ntp_addr, ntp_port)),
+                &udp_socket,
+                ntp_context,
+            )
+            .await;
+            match ntp_result {
+                Ok(time) => {
+                    info!("NTP time: {:?}", time);
+                    let dt = DateTime::from_timestamp(
+                        time.sec() as i64,
+                        fraction_to_nanoseconds(time.sec_fraction()),
+                    )
+                    .unwrap();
+                    let _ = rtc.set_datetime(dt.naive_utc().into());
+                    let rtc_time = time_provider.now().unwrap();
+                    info!(
+                        "Current time from RTC after NTP sync: {}-{}-{} {}:{}:{}",
+                        rtc_time.year(),
+                        rtc_time.month(),
+                        rtc_time.day(),
+                        rtc_time.hour(),
+                        rtc_time.minute(),
+                        rtc_time.second()
+                    );
+                }
+                Err(e) => {
+                    error!("Failed to get NTP time: {:?}", e);
+                    continue;
+                }
+            }
+        }
+
         // Get endpoint information
         let port = *credentials.port() as u16;
         let (endpoint, server_name): ((Ipv4Address, u16), ServerName) =
@@ -154,8 +265,8 @@ async fn main(spawner: Spawner) {
             };
 
         // Establish TCP connection
-        let mut rx_buffer = [0; 4096];
-        let mut tx_buffer = [0; 4096];
+        rx_buffer.fill(0);
+        tx_buffer.fill(0);
         let socket = match connect_tcp_socket(stack, endpoint, &mut rx_buffer, &mut tx_buffer).await
         {
             Ok(s) => s,
@@ -259,7 +370,7 @@ async fn main(spawner: Spawner) {
                     break;
                 }
             }
-            Timer::after_secs(1).await;
+            Timer::after_secs(60).await;
         }
     }
     // --- END MQTT CLIENT ---
@@ -291,7 +402,7 @@ async fn connect_mqtt_client<'a>(
     let mut mqtt_client: MqttClient = Client::<'_, _, _, 1, 1, 1>::new(buffer);
     let connect_options = ConnectOptions {
         clean_start: true,
-        keep_alive: KeepAlive::Seconds(30),
+        keep_alive: KeepAlive::Seconds(90),
         session_expiry_interval: SessionExpiryInterval::EndOnDisconnect,
         user_name: None,
         password: None,

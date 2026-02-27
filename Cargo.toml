@@ -28,6 +28,7 @@ embassy-net = { version = "0.8.0", features = [
     "defmt",
     "dns",
     "tcp",
+    "udp",
     "dhcpv4",
     "medium-ethernet",
 ] }
@@ -54,6 +55,11 @@ rust-mqtt = { version = "0.4.1", default-features = false, features = [
 embedded-tls = { version = "0.18.0", default-features = false, features = [
     "defmt",
 ] }
+
+# NTP and time support
+chrono = { version = "0.4", default-features = false }
+sntpc = { version = "0.8", default-features = false, features = ["defmt"] }
+sntpc-net-embassy = { version = "0.8", default-features = false, features = ["defmt"] }
 
 # Supplemental crates for embassy-net stack
 embedded-io-async = { version = "0.7.0" }
