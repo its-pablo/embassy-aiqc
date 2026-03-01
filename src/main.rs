@@ -16,8 +16,12 @@ use embassy_stm32::peripherals::{ETH, ETH_SMA, RNG};
 use embassy_stm32::rng::Rng;
 use embassy_stm32::rtc::{Rtc, RtcConfig, RtcTimeProvider};
 use embassy_stm32::{Config, Peri, bind_interrupts, eth, flash, peripherals, rng};
-use embassy_sync::once_lock::OnceLock;
-use embassy_time::Timer;
+use embassy_sync::{
+    blocking_mutex::raw::NoopRawMutex,
+    channel::{Channel, Sender},
+    once_lock::OnceLock,
+};
+use embassy_time::{Ticker, Timer};
 
 // MQTT support
 use rust_mqtt::Bytes;
@@ -154,6 +158,15 @@ async fn main(spawner: Spawner) {
             rtc_time.second()
         );
     }
+
+    // Set up channels for inter-task communication
+    static CH: StaticCell<Channel<NoopRawMutex, String<128>, 4>> = StaticCell::new();
+    let ch = CH.init(Channel::new());
+    let ch_tx = ch.sender();
+    let ch_rx = ch.receiver();
+
+    // Start sender task to send messages to MQTT task
+    unwrap!(spawner.spawn(sender(ch_tx)));
 
     // --- BEGIN NETWORK STACK SETUP ---
     // RNG peripheral needed for network stack
@@ -334,24 +347,19 @@ async fn main(spawner: Spawner) {
             }
         }
 
+        let tn: Bytes = b"test/topic".as_slice().into();
+        let tn: MqttString = MqttString::new(tn).unwrap();
+        let tn: TopicName = unsafe { TopicName::new_unchecked(tn) };
+        let pub_opts = PublicationOptions {
+            topic: tn,
+            qos: rust_mqtt::types::QoS::AtLeastOnce,
+            retain: false,
+        };
+
         loop {
-            let tn: Bytes = b"test/topic".as_slice().into();
-            let tn: MqttString = MqttString::new(tn).unwrap();
-            let tn: TopicName = unsafe { TopicName::new_unchecked(tn) };
-            let pub_opts = PublicationOptions {
-                topic: tn,
-                qos: rust_mqtt::types::QoS::AtLeastOnce,
-                retain: false,
-            };
-            match mqtt_client
-                .publish(
-                    &pub_opts,
-                    b"{\"message\": \"Hello from STM32 NUCLEO-H755ZI-Q!\"}"
-                        .as_slice()
-                        .into(),
-                )
-                .await
-            {
+            let msg = ch_rx.receive().await;
+            let msg: Bytes = msg.as_bytes().into();
+            match mqtt_client.publish(&pub_opts, msg).await {
                 Ok(_) => {
                     let mut success: bool = true;
                     info!("MQTT publish to {} successful!", server_name);
@@ -382,7 +390,6 @@ async fn main(spawner: Spawner) {
                     break;
                 }
             }
-            Timer::after_secs(60).await;
         }
     }
     // --- END MQTT CLIENT ---
@@ -402,6 +409,32 @@ async fn blinky(led: Peri<'static, AnyPin>, period: u64) -> ! {
 
         led.set_low();
         Timer::after_millis(period / 2).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn sender(ch_tx: Sender<'static, NoopRawMutex, String<128>, 4>) -> ! {
+    let mut count: u32 = 0;
+    let mut ticker = Ticker::every(embassy_time::Duration::from_secs(60));
+    loop {
+        ticker.next().await;
+        let msg: String<128> = {
+            let time_provider = TIME_PROVIDER.get().await;
+            let rtc_time = time_provider.now().unwrap();
+            format!(
+                "{{ \"message\": \"Hello from sender on {}-{}-{} at {}:{}:{} UTC! Count: {}\" }}",
+                rtc_time.year(),
+                rtc_time.month(),
+                rtc_time.day(),
+                rtc_time.hour(),
+                rtc_time.minute(),
+                rtc_time.second(),
+                count
+            )
+            .unwrap()
+        };
+        ch_tx.send(msg).await;
+        count += 1;
     }
 }
 
