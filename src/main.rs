@@ -299,7 +299,7 @@ async fn main(spawner: Spawner) {
         .await
         {
             Ok(tls) => tls,
-            Err(()) => break, //continue,
+            Err(()) => continue,
         };
 
         // Establish MQTT connection
