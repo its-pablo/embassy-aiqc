@@ -52,9 +52,17 @@ rust-mqtt = { version = "0.4.1", default-features = false, features = [
 ] }
 
 # TLS support
-embedded-tls = { version = "0.18.0", default-features = false, features = [
-    "defmt",
-] }
+embedded-tls = {
+    git = "https://github.com/its-pablo/embedded-tls.git",
+    rev = "c06508ad5e53cec5b7a32a79ae4338e471ac694b",
+    default-features = false,
+    features = [
+        "defmt",
+        "rustpki",
+    ]
+}
+p256 = { version = "0.13", default-features = false, features = [ "ecdsa" ] }
+signature = { version = "2.2", default-features = false }
 
 # NTP and time support
 chrono = { version = "0.4", default-features = false }
@@ -80,4 +88,13 @@ debug = 2
 debug-assertions = false # <-
 incremental = false
 opt-level = 3            # <-
+overflow-checks = false  # <-
+
+# cargo build/run
+[profile.dev]
+codegen-units = 16
+debug = 2
+debug-assertions = true  # <-
+incremental = false
+opt-level = "s"          # <-
 overflow-checks = false  # <-

@@ -16,6 +16,7 @@ use embassy_stm32::peripherals::{ETH, ETH_SMA, RNG};
 use embassy_stm32::rng::Rng;
 use embassy_stm32::rtc::{Rtc, RtcConfig, RtcTimeProvider};
 use embassy_stm32::{Config, Peri, bind_interrupts, eth, flash, peripherals, rng};
+use embassy_sync::once_lock::OnceLock;
 use embassy_time::Timer;
 
 // MQTT support
@@ -28,9 +29,7 @@ use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
 use rust_mqtt::types::{MqttString, TopicName};
 
 // TLS support
-use embedded_tls::{
-    Aes128GcmSha256, Certificate::X509, TlsConfig, TlsConnection, TlsContext, UnsecureProvider,
-};
+use embedded_tls::{Aes128GcmSha256, Certificate::X509, TlsConfig, TlsConnection, TlsContext};
 
 // NTP and time support
 use chrono::{DateTime, Duration, NaiveDateTime};
@@ -42,6 +41,12 @@ use static_cell::StaticCell;
 
 use defmt::{error, info, unwrap};
 use {defmt_rtt as _, panic_probe as _};
+
+// Pitchfork use statements
+use crate::pitchfork::tls::PitchforkCryptoProvider;
+
+// Pitchfork modules
+mod pitchfork;
 
 // --- BEGIN PROTOBUF SETUP ---
 use heapless::{String, format};
@@ -71,7 +76,10 @@ bind_interrupts!(struct Irqs {
 });
 
 const CREDENTIALS_OFFSET: u32 = BANK1_REGION.size / 2;
-const NTP_SERVER: &str = "pool.ntp.org";
+const NTP_SERVER: &str = "time.google.com";
+
+// Static RTC time provider for usage throughout the entire application
+pub static TIME_PROVIDER: OnceLock<RtcTimeProvider> = OnceLock::new();
 
 #[derive(Copy, Clone)]
 struct TimestampGenerator<'a> {
@@ -133,16 +141,19 @@ async fn main(spawner: Spawner) {
 
     // Set up RTC for time keeping
     let (mut rtc, time_provider) = Rtc::new(p.RTC, RtcConfig::default());
-    let rtc_time = time_provider.now().unwrap();
-    info!(
-        "Current time from RTC at boot: {}-{}-{} {}:{}:{}",
-        rtc_time.year(),
-        rtc_time.month(),
-        rtc_time.day(),
-        rtc_time.hour(),
-        rtc_time.minute(),
-        rtc_time.second()
-    );
+    {
+        let time_provider = TIME_PROVIDER.get_or_init(|| time_provider);
+        let rtc_time = time_provider.now().unwrap();
+        info!(
+            "Current time from RTC at boot: {}-{}-{} {}:{}:{}",
+            rtc_time.year(),
+            rtc_time.month(),
+            rtc_time.day(),
+            rtc_time.hour(),
+            rtc_time.minute(),
+            rtc_time.second()
+        );
+    }
 
     // --- BEGIN NETWORK STACK SETUP ---
     // RNG peripheral needed for network stack
@@ -218,6 +229,7 @@ async fn main(spawner: Spawner) {
             );
             udp_socket.bind(123).unwrap();
             let udp_socket = UdpSocketWrapper::new(udp_socket);
+            let time_provider = TIME_PROVIDER.get().await;
             let ts_gen = TimestampGenerator {
                 duration: Duration::zero(),
                 time_provider: &time_provider,
@@ -287,7 +299,7 @@ async fn main(spawner: Spawner) {
         .await
         {
             Ok(tls) => tls,
-            Err(()) => continue,
+            Err(()) => break, //continue,
         };
 
         // Establish MQTT connection
@@ -432,19 +444,13 @@ async fn open_tls_session<'a>(
     tx_buffer: &'a mut [u8],
 ) -> Result<TcpTlsConnection<'a>, ()> {
     info!("Establishing TLS handshake...");
-    let config = TlsConfig::new()
-        .with_server_name(&server_name)
+    let config = TlsConfig::new().with_server_name(&server_name);
+    let provider = PitchforkCryptoProvider::new(rng)
         .with_ca(X509(credentials.ca().as_slice()))
         .with_cert(X509(credentials.cert().as_slice()))
         .with_priv_key(credentials.key().as_slice());
     let mut tls = TlsConnection::new(socket, rx_buffer, tx_buffer);
-    match tls
-        .open(TlsContext::new(
-            &config,
-            UnsecureProvider::new::<Aes128GcmSha256>(rng),
-        ))
-        .await
-    {
+    match tls.open(TlsContext::new(&config, provider)).await {
         Ok(()) => {
             info!("TLS handshake established!");
             Ok(tls)
@@ -464,7 +470,7 @@ async fn connect_tcp_socket<'a>(
 ) -> Result<TcpSocket<'a>, ()> {
     info!("Establishing TCP connection...");
     let mut socket = TcpSocket::new(stack, rx_buffer, tx_buffer);
-    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+    socket.set_timeout(Some(embassy_time::Duration::from_secs(90)));
     match socket.connect(endpoint).await {
         Ok(()) => {
             info!("Connected to endpoint: {:?}", endpoint);
