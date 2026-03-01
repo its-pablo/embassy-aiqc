@@ -1,0 +1,35 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "preLaunchTask": "${defaultBuildTask}",
+            "type": "probe-rs-debug",
+            "request": "launch",
+            "name": "probe_rs Launch Debug",
+            "flashingConfig": {
+                "flashingEnabled": true,
+            },
+            "chip": "STM32H755ZI",
+            "coreConfigs": [
+                {
+                    "coreIndex": 0,
+                    "rttEnabled": true,
+                    "programBinary": "${workspaceFolder}/target/thumbv7em-none-eabihf/debug/embassy-aiqc",
+                }
+            ]
+        },
+        {
+            "type": "probe-rs-debug",
+            "request": "attach",
+            "name": "probe_rs Attach Debug",
+            "chip": "STM32H755ZI",
+            "coreConfigs": [
+                {
+                    "coreIndex": 0,
+                    "rttEnabled": true,
+                    "programBinary": "${workspaceFolder}/target/thumbv7em-none-eabihf/debug/embassy-aiqc",
+                }
+            ]
+        }
+    ]
+}
