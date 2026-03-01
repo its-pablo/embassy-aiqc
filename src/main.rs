@@ -21,13 +21,14 @@ use embassy_sync::{
     channel::{Channel, Sender},
     once_lock::OnceLock,
 };
-use embassy_time::{Ticker, Timer};
+use embassy_time::{Ticker, Timer, WithTimeout};
 
 // MQTT support
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::{
     Client, event::Event, options::ConnectOptions, options::PublicationOptions,
+    options::RetainHandling, options::SubscriptionOptions,
 };
 use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
 use rust_mqtt::types::{MqttString, TopicName};
@@ -43,7 +44,7 @@ use sntpc_net_embassy::UdpSocketWrapper;
 // Supplemental crates for network stack
 use static_cell::StaticCell;
 
-use defmt::{error, info, unwrap};
+use defmt::{error, info, unwrap, warn};
 use {defmt_rtt as _, panic_probe as _};
 
 // Pitchfork use statements
@@ -356,38 +357,87 @@ async fn main(spawner: Spawner) {
             retain: false,
         };
 
+        let tn: Bytes = b"test/topic".as_slice().into();
+        let tn: MqttString = MqttString::new(tn).unwrap();
+        let tn: TopicName = unsafe { TopicName::new_unchecked(tn) };
+        let sub_opts = SubscriptionOptions {
+            qos: rust_mqtt::types::QoS::AtLeastOnce,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: RetainHandling::SendIfNotSubscribedBefore,
+        };
+        match mqtt_client.subscribe(tn.into(), sub_opts).await {
+            Ok(_) => info!("MQTT subscription successful!"),
+            Err(e) => {
+                error!("MQTT subscription failed, error: {:?}", e);
+                continue;
+            }
+        }
+
+        let mut pub_ack_pending: Option<u16> = None;
+
         loop {
-            let msg = ch_rx.receive().await;
-            let msg: Bytes = msg.as_bytes().into();
-            match mqtt_client.publish(&pub_opts, msg).await {
-                Ok(_) => {
-                    let mut success: bool = true;
-                    info!("MQTT publish to {} successful!", server_name);
-                    loop {
-                        match mqtt_client.poll().await {
-                            Ok(Event::PublishAcknowledged(_)) => {
-                                info!("Publish acknowledged");
-                                break;
+            // Poll cancel safe header to process any events
+            let header = mqtt_client.poll_header();
+            let header = header
+                .with_timeout(embassy_time::Duration::from_millis(10))
+                .await;
+            match header {
+                Ok(Ok(h)) => match mqtt_client.poll_body(h).await {
+                    Ok(Event::PublishAcknowledged(pub_ack)) => {
+                        if Some(pub_ack.packet_identifier) == pub_ack_pending {
+                            info!(
+                                "Publish acknowledged for packet identifier {}",
+                                pub_ack.packet_identifier
+                            );
+                            pub_ack_pending = None;
+                        } else {
+                            warn!(
+                                "Received publish acknowledgment for packet identifier {}, but no pending publish found",
+                                pub_ack.packet_identifier
+                            );
+                        }
+                    }
+                    Ok(Event::Publish(publication)) => {
+                        info!(
+                            "Received publish on topic {} with payload {:?}",
+                            publication.topic,
+                            MqttString::new(publication.message).unwrap()
+                        );
+                    }
+                    Ok(e) => info!("Received event {:?}", e),
+                    Err(e) => {
+                        error!("Failed to poll body: {:?}", e);
+                        break;
+                    }
+                },
+                Ok(Err(e)) => {
+                    error!("Failed to poll header: {:?}", e);
+                    break;
+                }
+                // If no headers were received during this period of time move on and check if
+                // there are messages to publish.
+                Err(_) => {}
+            }
+
+            // Check if there are any messages pending to publish
+            if pub_ack_pending.is_none() {
+                let msg = ch_rx.try_receive();
+                match msg {
+                    Ok(m) => {
+                        let msg: Bytes = m.as_bytes().into();
+                        match mqtt_client.publish(&pub_opts, msg).await {
+                            Ok(packet_id) => {
+                                info!("MQTT publish to {} successful!", server_name);
+                                pub_ack_pending = Some(packet_id);
                             }
-                            Ok(Event::PublishComplete(_)) => {
-                                info!("Publish complete");
-                                break;
-                            }
-                            Ok(e) => info!("Received event {:?}", e),
                             Err(e) => {
-                                error!("Failed to poll: {:?}", e);
-                                success = false;
+                                error!("MQTT publish to {} failed, error: {:?}", server_name, e);
                                 break;
                             }
                         }
                     }
-                    if !success {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!("MQTT publish to {} failed, error: {:?}", server_name, e);
-                    break;
+                    Err(_) => {}
                 }
             }
         }
