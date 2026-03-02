@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package storage;
+package pitchfork;
 
 message Credentials {
     oneof broker {

@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package pitchfork;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+message Measurement {
+    float moisture = 1;
+}
+
+message Command {
+    oneof cmd {
+        google.protobuf.Empty enumerate = 1;
+    }
+}
+
+message Packet {
+    google.protobuf.Timestamp timestamp = 1;
+    oneof payload {
+        Measurement measurement = 2;
+        Command command = 3;
+    }
+}

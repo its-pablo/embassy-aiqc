@@ -20,25 +20,36 @@ fn proto_generate() {
     let mut generator = Generator::new();
     generator
         .use_container_heapless()
-        .configure(".storage.Credentials.domain", Config::new().max_bytes(1024))
-        .configure(".storage.Credentials.ipv4", Config::new().max_bytes(4))
         .configure(
-            ".storage.Credentials.client_id",
+            ".pitchfork.Credentials.domain",
             Config::new().max_bytes(1024),
         )
-        .configure(".storage.Credentials.ca", Config::new().max_bytes(8 * 1024))
+        .configure(".pitchfork.Credentials.ipv4", Config::new().max_bytes(4))
         .configure(
-            ".storage.Credentials.cert",
+            ".pitchfork.Credentials.client_id",
+            Config::new().max_bytes(1024),
+        )
+        .configure(
+            ".pitchfork.Credentials.ca",
             Config::new().max_bytes(8 * 1024),
         )
         .configure(
-            ".storage.Credentials.key",
+            ".pitchfork.Credentials.cert",
+            Config::new().max_bytes(8 * 1024),
+        )
+        .configure(
+            ".pitchfork.Credentials.key",
             Config::new().max_bytes(8 * 1024),
         )
         .add_protoc_arg("-Iproto");
     generator
         .compile_protos(
-            &["storage.proto", "measure.proto"],
+            &[
+                "google/protobuf/timestamp.proto",
+                "google/protobuf/empty.proto",
+                "storage.proto",
+                "comms.proto",
+            ],
             std::env::var("OUT_DIR").unwrap() + "/aiqc-proto.rs",
         )
         .unwrap();

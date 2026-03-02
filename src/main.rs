@@ -54,8 +54,8 @@ use crate::pitchfork::tls::PitchforkCryptoProvider;
 mod pitchfork;
 
 // --- BEGIN PROTOBUF SETUP ---
-use heapless::{String, format};
-use micropb::{MessageDecode, PbDecoder};
+use heapless::{String, Vec, format};
+use micropb::{MessageDecode, MessageEncode, PbDecoder, PbEncoder};
 
 mod proto {
     #![allow(clippy::all)]
@@ -63,7 +63,7 @@ mod proto {
     include!(concat!(env!("OUT_DIR"), "/aiqc-proto.rs"));
 }
 
-use proto::storage_::{Credentials, Credentials_::Broker};
+use proto::pitchfork_::{Credentials, Credentials_::Broker, Packet, Packet_::Payload};
 // --- END PROTOBUF SETUP ---
 
 type EthernetDevice = Ethernet<'static, ETH, GenericPhy<Sma<'static, ETH_SMA>>>;
@@ -161,7 +161,7 @@ async fn main(spawner: Spawner) {
     }
 
     // Set up channels for inter-task communication
-    static CH: StaticCell<Channel<NoopRawMutex, String<128>, 4>> = StaticCell::new();
+    static CH: StaticCell<Channel<NoopRawMutex, Vec<u8, 128>, 4>> = StaticCell::new();
     let ch = CH.init(Channel::new());
     let ch_tx = ch.sender();
     let ch_rx = ch.receiver();
@@ -399,11 +399,27 @@ async fn main(spawner: Spawner) {
                         }
                     }
                     Ok(Event::Publish(publication)) => {
-                        info!(
-                            "Received publish on topic {} with payload {:?}",
-                            publication.topic,
-                            MqttString::new(publication.message).unwrap()
-                        );
+                        // Decode contents of publication.message as a Packet protobuf message
+                        let message: &[u8] = publication.message.as_ref();
+                        let mut packet = Packet::default();
+                        let mut decoder = PbDecoder::new(message);
+                        match packet.decode(&mut decoder, message.len()) {
+                            Ok(()) => match packet.payload {
+                                Some(Payload::Measurement(measurement)) => {
+                                    info!(
+                                        "Received measurement: moisture = {:?}",
+                                        measurement.moisture
+                                    );
+                                }
+                                Some(Payload::Command(_)) => {
+                                    info!("Received command!");
+                                }
+                                None => {
+                                    warn!("Received packet with no payload");
+                                }
+                            },
+                            Err(_) => error!("Failed to decode packet from publication!"),
+                        }
                     }
                     Ok(e) => info!("Received event {:?}", e),
                     Err(e) => {
@@ -425,10 +441,14 @@ async fn main(spawner: Spawner) {
                 let msg = ch_rx.try_receive();
                 match msg {
                     Ok(m) => {
-                        let msg: Bytes = m.as_bytes().into();
+                        let msg: Bytes = m.as_slice().into();
+                        let msg_size = msg.len();
                         match mqtt_client.publish(&pub_opts, msg).await {
                             Ok(packet_id) => {
-                                info!("MQTT publish to {} successful!", server_name);
+                                info!(
+                                    "MQTT publish to {} successful! Message size: {} bytes",
+                                    server_name, msg_size
+                                );
                                 pub_ack_pending = Some(packet_id);
                             }
                             Err(e) => {
@@ -463,28 +483,26 @@ async fn blinky(led: Peri<'static, AnyPin>, period: u64) -> ! {
 }
 
 #[embassy_executor::task]
-async fn sender(ch_tx: Sender<'static, NoopRawMutex, String<128>, 4>) -> ! {
-    let mut count: u32 = 0;
+async fn sender(ch_tx: Sender<'static, NoopRawMutex, Vec<u8, 128>, 4>) -> ! {
     let mut ticker = Ticker::every(embassy_time::Duration::from_secs(60));
     loop {
         ticker.next().await;
-        let msg: String<128> = {
+        let timestamp: NaiveDateTime = {
             let time_provider = TIME_PROVIDER.get().await;
             let rtc_time = time_provider.now().unwrap();
-            format!(
-                "{{ \"message\": \"Hello from sender on {}-{}-{} at {}:{}:{} UTC! Count: {}\" }}",
-                rtc_time.year(),
-                rtc_time.month(),
-                rtc_time.day(),
-                rtc_time.hour(),
-                rtc_time.minute(),
-                rtc_time.second(),
-                count
-            )
-            .unwrap()
+            rtc_time.into()
         };
+        let dur = timestamp.signed_duration_since(DateTime::UNIX_EPOCH.naive_utc());
+        let mut packet = Packet::default();
+        packet.timestamp.seconds = dur.num_seconds();
+        packet.timestamp.nanos = dur.subsec_nanos();
+        packet.payload = Some(proto::pitchfork_::Packet_::Payload::Measurement(
+            proto::pitchfork_::Measurement { moisture: 0.42 },
+        ));
+        let mut msg: Vec<u8, 128> = Vec::new();
+        let mut encoder = PbEncoder::new(&mut msg);
+        packet.encode(&mut encoder).unwrap();
         ch_tx.send(msg).await;
-        count += 1;
     }
 }
 

@@ -1,7 +1,0 @@
-syntax = "proto3";
-
-package measure;
-
-message Measurement {
-    float temperature = 1;
-}
