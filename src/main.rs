@@ -63,6 +63,7 @@ mod proto {
     include!(concat!(env!("OUT_DIR"), "/aiqc-proto.rs"));
 }
 
+use proto::google_::protobuf_::Timestamp;
 use proto::pitchfork_::{Credentials, Credentials_::Broker, Packet, Packet_::Payload};
 // --- END PROTOBUF SETUP ---
 
@@ -407,8 +408,10 @@ async fn main(spawner: Spawner) {
                             Ok(()) => match packet.payload {
                                 Some(Payload::Measurement(measurement)) => {
                                     info!(
-                                        "Received measurement: moisture = {:?}",
-                                        measurement.moisture
+                                        "Received measurement: moisture = {:?}, timestamp = {} seconds and {} nanos since UNIX epoch",
+                                        measurement.moisture,
+                                        packet.timestamp.seconds,
+                                        packet.timestamp.nanos
                                     );
                                 }
                                 Some(Payload::Command(_)) => {
@@ -494,8 +497,10 @@ async fn sender(ch_tx: Sender<'static, NoopRawMutex, Vec<u8, 128>, 4>) -> ! {
         };
         let dur = timestamp.signed_duration_since(DateTime::UNIX_EPOCH.naive_utc());
         let mut packet = Packet::default();
-        packet.timestamp.seconds = dur.num_seconds();
-        packet.timestamp.nanos = dur.subsec_nanos();
+        let mut packet_ts = Timestamp::default();
+        packet_ts.seconds = dur.num_seconds();
+        packet_ts.nanos = dur.subsec_nanos();
+        packet.set_timestamp(packet_ts);
         packet.payload = Some(proto::pitchfork_::Packet_::Payload::Measurement(
             proto::pitchfork_::Measurement { moisture: 0.42 },
         ));
