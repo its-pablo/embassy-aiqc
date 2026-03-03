@@ -9,13 +9,17 @@ use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpAddress, Ipv4Address, Stack, StackResources, dns};
 use embassy_stm32::SharedData;
+use embassy_stm32::adc::{
+    Adc, AdcChannel as _, AdcConfig, AnyAdcChannel, Averaging, Resolution, SampleTime,
+    resolution_to_max_count,
+};
 use embassy_stm32::eth::{Ethernet, GenericPhy, PacketQueue, Sma};
 use embassy_stm32::flash::{BANK1_REGION, Flash, WRITE_SIZE};
 use embassy_stm32::gpio::{AnyPin, Level, Output, Speed};
-use embassy_stm32::peripherals::{ETH, ETH_SMA, RNG};
+use embassy_stm32::peripherals::{ADC1, DMA1_CH1, ETH, ETH_SMA, RNG};
 use embassy_stm32::rng::Rng;
 use embassy_stm32::rtc::{Rtc, RtcConfig, RtcTimeProvider};
-use embassy_stm32::{Config, Peri, bind_interrupts, eth, flash, peripherals, rng};
+use embassy_stm32::{Config, Peri, bind_interrupts, dma, eth, flash, peripherals, rng};
 use embassy_sync::{
     blocking_mutex::raw::NoopRawMutex,
     channel::{Channel, Sender},
@@ -70,7 +74,7 @@ use proto::pitchfork_::{Credentials, Credentials_::Broker, Packet, Packet_::Payl
 type EthernetDevice = Ethernet<'static, ETH, GenericPhy<Sma<'static, ETH_SMA>>>;
 type ServerName = String<{ size_of::<Broker>() }>;
 type TcpTlsConnection<'a> = TlsConnection<'a, TcpSocket<'a>, Aes128GcmSha256>;
-type MqttClient<'a> = Client<'a, TcpTlsConnection<'a>, BumpBuffer<'a>, 1, 1, 1>;
+type MqttClient<'a> = Client<'a, TcpTlsConnection<'a>, BumpBuffer<'a>, 2, 2, 2>;
 
 #[unsafe(link_section = ".ram_d3.shared_data")]
 static SHARED_DATA: MaybeUninit<SharedData> = MaybeUninit::uninit();
@@ -79,6 +83,7 @@ bind_interrupts!(struct Irqs {
     FLASH => flash::InterruptHandler;
     ETH => eth::InterruptHandler;
     HASH_RNG => rng::InterruptHandler<peripherals::RNG>;
+    DMA1_STREAM1 => dma::InterruptHandler<peripherals::DMA1_CH1>;
 });
 
 const CREDENTIALS_OFFSET: u32 = BANK1_REGION.size / 2;
@@ -123,6 +128,14 @@ async fn main(spawner: Spawner) {
             divq: Some(PllDiv::DIV8), // 100mhz
             divr: None,
         });
+        config.rcc.pll2 = Some(Pll {
+            source: PllSource::HSI,
+            prediv: PllPreDiv::DIV4,
+            mul: PllMul::MUL50,
+            divp: Some(PllDiv::DIV8), // 100mhz
+            divq: None,
+            divr: None,
+        });
         config.rcc.sys = Sysclk::PLL1_P; // 400 Mhz
         config.rcc.ahb_pre = AHBPrescaler::DIV2; // 200 Mhz
         config.rcc.apb1_pre = APBPrescaler::DIV2; // 100 Mhz
@@ -131,12 +144,13 @@ async fn main(spawner: Spawner) {
         config.rcc.apb4_pre = APBPrescaler::DIV2; // 100 Mhz
         config.rcc.voltage_scale = VoltageScale::Scale1;
         config.rcc.supply_config = SupplyConfig::DirectSMPS;
+        config.rcc.mux.adcsel = mux::Adcsel::PLL2_P;
     }
     let p = embassy_stm32::init_primary(config, &SHARED_DATA);
     info!("Clock and peripherals ready!");
 
     // Start blinky as proof that we aren't significantly stalling at any point
-    unwrap!(spawner.spawn(blinky(p.PB0.into(), 200)));
+    spawner.spawn(unwrap!(blinky(p.PB0.into(), 200)));
 
     // --- BEGIN READING CREDENTIALS ---
     let mut f = Flash::new(p.FLASH, Irqs);
@@ -161,6 +175,16 @@ async fn main(spawner: Spawner) {
         );
     }
 
+    // Set up ADC and DMA
+    static DMA_BUFFER: StaticCell<[u16; 1]> = StaticCell::new();
+    let dma_buffer = DMA_BUFFER.init([0; 1]);
+    let mut adc_config = AdcConfig::default();
+    adc_config.resolution = Some(Resolution::BITS16);
+    adc_config.averaging = Some(Averaging::Samples8);
+    let adc: Adc<'_, ADC1> = Adc::new_with_config(p.ADC1, adc_config);
+    let dma = p.DMA1_CH1;
+    let sig: AnyAdcChannel<'_, ADC1> = p.PA0.degrade_adc();
+
     // Set up channels for inter-task communication
     static CH: StaticCell<Channel<NoopRawMutex, Vec<u8, 128>, 4>> = StaticCell::new();
     let ch = CH.init(Channel::new());
@@ -168,7 +192,7 @@ async fn main(spawner: Spawner) {
     let ch_rx = ch.receiver();
 
     // Start sender task to send messages to MQTT task
-    unwrap!(spawner.spawn(sender(ch_tx)));
+    spawner.spawn(unwrap!(sender(ch_tx, adc, dma, sig, dma_buffer)));
 
     // --- BEGIN NETWORK STACK SETUP ---
     // RNG peripheral needed for network stack
@@ -207,7 +231,7 @@ async fn main(spawner: Spawner) {
         RESOURCES.init(StackResources::new()),
         seed,
     );
-    unwrap!(spawner.spawn(net_task(runner)));
+    spawner.spawn(unwrap!(net_task(runner)));
     stack.wait_config_up().await;
     info!("Network task initialized.");
     // --- END NETWORK STACK SETUP ---
@@ -486,10 +510,24 @@ async fn blinky(led: Peri<'static, AnyPin>, period: u64) -> ! {
 }
 
 #[embassy_executor::task]
-async fn sender(ch_tx: Sender<'static, NoopRawMutex, Vec<u8, 128>, 4>) -> ! {
+async fn sender(
+    ch_tx: Sender<'static, NoopRawMutex, Vec<u8, 128>, 4>,
+    mut adc: Adc<'static, ADC1>,
+    mut dma: Peri<'static, DMA1_CH1>,
+    mut sig: AnyAdcChannel<'static, ADC1>,
+    dma_buffer: &'static mut [u16; 1],
+) -> ! {
     let mut ticker = Ticker::every(embassy_time::Duration::from_secs(60));
     loop {
         ticker.next().await;
+        adc.read(
+            dma.reborrow(),
+            Irqs,
+            [(&mut sig, SampleTime::CYCLES810_5)].into_iter(),
+            dma_buffer,
+        )
+        .await;
+        let measured = dma_buffer[0];
         let timestamp: NaiveDateTime = {
             let time_provider = TIME_PROVIDER.get().await;
             let rtc_time = time_provider.now().unwrap();
@@ -502,7 +540,9 @@ async fn sender(ch_tx: Sender<'static, NoopRawMutex, Vec<u8, 128>, 4>) -> ! {
         packet_ts.nanos = dur.subsec_nanos();
         packet.set_timestamp(packet_ts);
         packet.payload = Some(proto::pitchfork_::Packet_::Payload::Measurement(
-            proto::pitchfork_::Measurement { moisture: 0.42 },
+            proto::pitchfork_::Measurement {
+                moisture: measured as f32 / resolution_to_max_count(Resolution::BITS16) as f32,
+            },
         ));
         let mut msg: Vec<u8, 128> = Vec::new();
         let mut encoder = PbEncoder::new(&mut msg);
@@ -517,7 +557,7 @@ async fn connect_mqtt_client<'a>(
     buffer: &'a mut BumpBuffer<'a>,
 ) -> Result<MqttClient<'a>, ()> {
     info!("Establishing MQTT connection...");
-    let mut mqtt_client: MqttClient = Client::<'_, _, _, 1, 1, 1>::new(buffer);
+    let mut mqtt_client: MqttClient = Client::<'_, _, _, 2, 2, 2>::new(buffer);
     let connect_options = ConnectOptions {
         clean_start: true,
         keep_alive: KeepAlive::Seconds(90),

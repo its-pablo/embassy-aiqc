@@ -7,7 +7,7 @@ edition = "2024"
 embassy-stm32 = { version = "0.5.0", features = [
     "defmt",
     "stm32h755zi-cm7",
-    "time-driver-tim3",
+    "time-driver-tim5",
     "exti",
     "memory-x",
     "unstable-pac",
@@ -76,6 +76,15 @@ static_cell = "2"
 # Crates for protobuf
 heapless = "0.9"
 micropb = { version = "0.6.0", features = ["container-heapless-0-9"] }
+
+[patch.crates-io]
+embassy-stm32 = { git = "https://github.com/embassy-rs/embassy.git" }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy.git" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy.git" }
+embassy-net = { git = "https://github.com/embassy-rs/embassy.git" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy.git" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy.git" }
+embassy-net-driver = { git = "https://github.com/embassy-rs/embassy.git" }
 
 [build-dependencies]
 # Crates for protobuf
