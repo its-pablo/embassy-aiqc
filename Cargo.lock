@@ -813,7 +813,7 @@ dependencies = [
 [[package]]
 name = "embedded-tls"
 version = "0.19.0"
-source = "git+https://github.com/its-pablo/embedded-tls.git?rev=c06508ad5e53cec5b7a32a79ae4338e471ac694b#c06508ad5e53cec5b7a32a79ae4338e471ac694b"
+source = "git+https://github.com/drogue-iot/embedded-tls.git?rev=bd13e11ce9c7605baf7018ef2b0f353ae6693016#bd13e11ce9c7605baf7018ef2b0f353ae6693016"
 dependencies = [
  "aes-gcm",
  "const-oid 0.10.2",

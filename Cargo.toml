@@ -53,8 +53,8 @@ rust-mqtt = { version = "0.4.1", default-features = false, features = [
 
 # TLS support
 embedded-tls = {
-    git = "https://github.com/its-pablo/embedded-tls.git",
-    rev = "c06508ad5e53cec5b7a32a79ae4338e471ac694b",
+    git = "https://github.com/drogue-iot/embedded-tls.git",
+    rev = "bd13e11ce9c7605baf7018ef2b0f353ae6693016",
     default-features = false,
     features = [
         "defmt",

@@ -408,52 +408,60 @@ async fn main(spawner: Spawner) {
                 .with_timeout(embassy_time::Duration::from_millis(10))
                 .await;
             match header {
-                Ok(Ok(h)) => match mqtt_client.poll_body(h).await {
-                    Ok(Event::PublishAcknowledged(pub_ack)) => {
-                        if Some(pub_ack.packet_identifier) == pub_ack_pending {
-                            info!(
-                                "Publish acknowledged for packet identifier {}",
-                                pub_ack.packet_identifier
-                            );
-                            pub_ack_pending = None;
-                        } else {
-                            warn!(
-                                "Received publish acknowledgment for packet identifier {}, but no pending publish found",
-                                pub_ack.packet_identifier
-                            );
+                Ok(Ok(h)) => {
+                    let body = mqtt_client.poll_body(h).await;
+                    match body {
+                        Ok(Event::PublishAcknowledged(pub_ack)) => {
+                            if Some(pub_ack.packet_identifier) == pub_ack_pending {
+                                info!(
+                                    "Publish acknowledged for packet identifier {}",
+                                    pub_ack.packet_identifier
+                                );
+                                pub_ack_pending = None;
+                            } else {
+                                warn!(
+                                    "Received publish acknowledgment for packet identifier {}, but no pending publish found",
+                                    pub_ack.packet_identifier
+                                );
+                            }
+                        }
+                        Ok(Event::Publish(publication)) => {
+                            // Decode contents of publication.message as a Packet protobuf message
+                            let message: &[u8] = publication.message.as_ref();
+                            let mut packet = Packet::default();
+                            let mut decoder = PbDecoder::new(message);
+                            match packet.decode(&mut decoder, message.len()) {
+                                Ok(()) => match packet.payload {
+                                    Some(Payload::Measurement(measurement)) => {
+                                        info!(
+                                            "Received measurement: moisture = {:?}, timestamp = {} seconds and {} nanos since UNIX epoch",
+                                            measurement.moisture,
+                                            packet.timestamp.seconds,
+                                            packet.timestamp.nanos
+                                        );
+                                    }
+                                    Some(Payload::Command(_)) => {
+                                        info!("Received command!");
+                                    }
+                                    None => {
+                                        warn!("Received packet with no payload");
+                                    }
+                                },
+                                Err(_) => error!("Failed to decode packet from publication!"),
+                            }
+                        }
+                        Ok(e) => info!("Received event {:?}", e),
+                        Err(e) => {
+                            error!("Failed to poll body: {:?}", e);
+                            break;
                         }
                     }
-                    Ok(Event::Publish(publication)) => {
-                        // Decode contents of publication.message as a Packet protobuf message
-                        let message: &[u8] = publication.message.as_ref();
-                        let mut packet = Packet::default();
-                        let mut decoder = PbDecoder::new(message);
-                        match packet.decode(&mut decoder, message.len()) {
-                            Ok(()) => match packet.payload {
-                                Some(Payload::Measurement(measurement)) => {
-                                    info!(
-                                        "Received measurement: moisture = {:?}, timestamp = {} seconds and {} nanos since UNIX epoch",
-                                        measurement.moisture,
-                                        packet.timestamp.seconds,
-                                        packet.timestamp.nanos
-                                    );
-                                }
-                                Some(Payload::Command(_)) => {
-                                    info!("Received command!");
-                                }
-                                None => {
-                                    warn!("Received packet with no payload");
-                                }
-                            },
-                            Err(_) => error!("Failed to decode packet from publication!"),
-                        }
-                    }
-                    Ok(e) => info!("Received event {:?}", e),
-                    Err(e) => {
-                        error!("Failed to poll body: {:?}", e);
-                        break;
-                    }
-                },
+                    // Safety: all Bytes<'c> from the received event are dropped at the end of
+                    // the match arms above. No references into the bump buffer remain. This is
+                    // the endorsed approach in the example:
+                    // https://github.com/obabec/rust-mqtt/blob/6fba431f0387f7bb294dcd51a3f0defb7e43c0c2/examples/demo.rs#L80-L83
+                    unsafe { mqtt_client.buffer().reset() };
+                }
                 Ok(Err(e)) => {
                     error!("Failed to poll header: {:?}", e);
                     break;
